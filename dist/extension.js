@@ -1047,6 +1047,24 @@ var GoogleGenerativeAI = class {
 };
 
 // src/extension.ts
+var GEMINI_API_KEY = "AIzaSyDdACIU3h59herh6ZjZnNw0oav4xRe8gK8";
+function parseAiOccurrences(aiText) {
+  const text = aiText.replace(/[`*]/g, "");
+  const re = /(Variable|Function|Import|Class|Statement):\s*([^\n]+)\s*[\r\n]+Scope:\s*([^\n]+)\s*[\r\n]+Lines:\s*(\d+)\s*-\s*(\d+)\s*[\r\n]+Code:\s*([\s\S]*?)(?=(?:\n(?:Variable|Function|Import|Class|Statement):)|$)/g;
+  const items = [];
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    items.push({
+      kind: m[1],
+      name: m[2].trim(),
+      scope: m[3].trim(),
+      startLine: parseInt(m[4], 10),
+      endLine: parseInt(m[5], 10),
+      code: m[6].trim()
+    });
+  }
+  return items;
+}
 function activate(context) {
   const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusBarItem.text = "$(rocket) Snapcode";
@@ -1064,28 +1082,114 @@ function activate(context) {
       "snapcodeWebview",
       "Snapcode Panel",
       vscode.ViewColumn.One,
-      {
-        enableScripts: true
-      }
+      { enableScripts: true }
     );
+    panel.webview.html = getWebviewContent();
     panel.webview.onDidReceiveMessage(
       async (message) => {
-        if (message.command === "runsHelloWorld") {
-          vscode.commands.executeCommand("Snapcode.helloWorld");
-        }
-        if (message.command === "analyzeFile") {
-          const result = await analyzeFile(message.filename);
-          panel.webview.postMessage({ command: "showResult", text: result });
-        }
-        if (message.command === "analyzeCode") {
-          const result = await analyzeCodeBlock(message.filepath, message.search);
-          panel.webview.postMessage({ command: "showResult1", text: result });
+        try {
+          if (message.command === "runsHelloWorld") {
+            vscode.commands.executeCommand("Snapcode.helloWorld");
+          }
+          if (message.command === "analyzeFile") {
+            const result = await analyzeFile(message.filename);
+            panel.webview.postMessage({ command: "showResult", text: result });
+          }
+          if (message.command === "analyzeCode") {
+            const result = await analyzeCodeBlock(message.filepath, message.search);
+            const occurrences = parseAiOccurrences(result);
+            panel.webview.postMessage({
+              command: "showResult1",
+              occurrences,
+              raw: result,
+              filepath: message.filepath
+            });
+          }
+          if (message.command === "requestScopeInfo") {
+            const { filepath } = message;
+            const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+            if (!workspacePath) {
+              panel.webview.postMessage({ command: "toast", text: "No workspace open" });
+              return;
+            }
+            const filePath = path.join(workspacePath, filepath);
+            if (!fs.existsSync(filePath)) {
+              panel.webview.postMessage({ command: "toast", text: `File not found: ${filepath}` });
+              return;
+            }
+            const docText = fs.readFileSync(filePath, "utf8");
+            const occ = message.occurrence;
+            const occurrence = occ || (() => {
+              throw new Error("Occurrence not provided");
+            })();
+            const scopeInfo = await getScopeInfoViaAI(
+              filepath,
+              docText,
+              occurrence,
+              GEMINI_API_KEY
+            );
+            panel.webview.postMessage({
+              command: "confirmDelete",
+              filepath,
+              occurrence,
+              scopeInfo
+            });
+          }
+          if (message.command === "performDelete") {
+            const { filepath, occurrence, variables, lines, scopeInfo } = message;
+            const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+            if (!workspacePath) {
+              panel.webview.postMessage({ command: "toast", text: "No workspace open" });
+              return;
+            }
+            const filePath = path.join(workspacePath, filepath);
+            if (!fs.existsSync(filePath)) {
+              panel.webview.postMessage({ command: "toast", text: `File not found: ${filePath}` });
+              return;
+            }
+            const original = fs.readFileSync(filePath, "utf8");
+            const aiCode = await aiDeleteAndFixFullFile(
+              filepath,
+              original,
+              occurrence,
+              variables,
+              lines,
+              scopeInfo,
+              GEMINI_API_KEY
+            );
+            panel.webview.postMessage({
+              command: "showMerger",
+              filepath,
+              original,
+              aiCode
+              // <- FIXED: was "aicode"
+            });
+          }
+          if (message.command === "applyMergedCode") {
+            const { filepath, merged } = message;
+            const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+            if (!workspacePath) {
+              panel.webview.postMessage({ command: "toast", text: "No workspace open" });
+              return;
+            }
+            const filePath = path.join(workspacePath, filepath);
+            try {
+              fs.writeFileSync(filePath, merged, "utf8");
+              panel.webview.postMessage({ command: "toast", text: `\u2705 Saved ${filepath}` });
+              const docUri = vscode.Uri.file(filePath);
+              const doc = await vscode.workspace.openTextDocument(docUri);
+              await vscode.window.showTextDocument(doc, { preview: false });
+            } catch (e) {
+              panel.webview.postMessage({ command: "toast", text: `Error saving file: ${e}` });
+            }
+          }
+        } catch (err) {
+          panel.webview.postMessage({ command: "toast", text: `Error: ${err}` });
         }
       },
       void 0,
       context.subscriptions
     );
-    panel.webview.html = getWebviewContent();
   });
   context.subscriptions.push(webViewCommand);
   async function analyzeFile(filename) {
@@ -1100,7 +1204,7 @@ function activate(context) {
     }
     const fileContent = fs.readFileSync(filePath, "utf8");
     try {
-      const genAI = new GoogleGenerativeAI("AIzaSyDdACIU3h59herh6ZjZnNw0oav4xRe8gK8");
+      const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
       const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
       const prompt = `
 You are a code analyzer. Given the following file:
@@ -1116,8 +1220,8 @@ Task:
 1. Find all unused imports.
 2. Find all unused variables.
 3. For each one, return the variable/import name and the line number.
-Return results in a clear list format.
-    `;
+Return results in a clear list format with NO markdown, NO asterisks, NO backticks.
+`;
       const result = await model.generateContent(prompt);
       let output = result.response.text();
       output = output.replace(/[`*]/g, "").trim();
@@ -1131,13 +1235,13 @@ Return results in a clear list format.
     if (!workspaceFolders) {
       return "No Workspace Folders";
     }
-    const worksspacepath = workspaceFolders[0].uri.fsPath;
-    const filePath = path.join(worksspacepath, filename);
+    const workspacePath = workspaceFolders[0].uri.fsPath;
+    const filePath = path.join(workspacePath, filename);
     if (!fs.existsSync(filePath)) {
       return `File not found:${filename}`;
     }
     const code = fs.readFileSync(filePath, "utf8");
-    const genAI = new GoogleGenerativeAI("AIzaSyDdACIU3h59herh6ZjZnNw0oav4xRe8gK8");
+    const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
     const prompt = `
 You are a code analyzer.
@@ -1149,15 +1253,15 @@ ${code}
 ---
 
 Task:
-1. Find all occurrences of "${searchTerm}" that are used and  unused.
+1. Find all occurrences of "${searchTerm}" that are used and unused.
 2. Consider scope: variables or functions inside another function or class must be treated separately from globals.
 3. For each occurrence, return:
    - type (variable/function/import)
    - exact code
    - start line and end line
    - parent scope (global or function/class name)
-4. Do NOT include anything that is **not "${searchTerm}"**.
-5. Return only plain text, no markdown or code blocks.
+4. Do NOT include anything that is not exactly "${searchTerm}".
+5. Return only plain text, no markdown, no backticks.
 
 Example output format:
 
@@ -1167,12 +1271,11 @@ Lines: 2-2
 Code:
 const unusedVar = 859;
 
-Function: unusedVar
+Variable: unusedVar
 Scope: function someFunction
-Lines: 5-7
+Lines: 5-5
 Code:
-const unusedVar = 90;
-
+unusedVar = 90;
 `;
     const result = await model.generateContent(prompt);
     let output = result.response.text();
@@ -1180,143 +1283,272 @@ const unusedVar = 90;
     console.log(output);
     return output;
   }
+  async function getScopeInfoViaAI(filename, fullcode, occurence, apikey) {
+    const genAI = new GoogleGenerativeAI(apikey);
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const prompt = `
+You are a precise code analyst.
+
+File: ${filename}
+
+code:
+---
+${fullcode}
+---
+
+Target occurrence:
+- kind: ${occurence.kind}
+- name: ${occurence.name}
+- lines: ${occurence.startLine}-${occurence.endLine}
+- scopeLabel: ${occurence.scope}
+
+Task:
+1) Find the nearest enclosing function or class for this occurrence (if none, scope is "global").
+2) Return STRICT JSON (no markdown) with:
+{
+  "scopeType": "function|class|global",
+  "scopeName": "<name or global>",
+  "scopeStartLine": <number>,
+  "scopeEndLine": <number>,
+  "variables": ["list","all","declared","names","in","this","scope"],
+  "lines": [<every integer line from scopeStartLine to scopeEndLine>]
+}
+ONLY JSON.
+`;
+    const res = await model.generateContent(prompt);
+    const text = res.response.text().replace(/[`*]/g, "").trim();
+    try {
+      return JSON.parse(text);
+    } catch {
+      return {
+        scopeType: "unknown",
+        scopeName: occurence.scope || "unknown",
+        scopeStartLine: occurence.startLine,
+        scopeEndLine: occurence.endLine,
+        variables: [],
+        lines: Array.from(
+          { length: occurence.endLine - occurence.startLine + 1 },
+          (_, i) => occurence.startLine + i
+        )
+      };
+    }
+  }
+  async function aiDeleteAndFixFullFile(filename, originalCode, occurrence, variables, lines, scopeInfo, apiKey) {
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const prompt = `
+You are a precise refactoring assistant.
+
+File: ${filename}
+
+Original code:
+---
+${originalCode}
+---
+
+Delete target:
+- kind: ${occurrence.kind}
+- name: ${occurrence.name}
+- occurrenceLines: ${occurrence.startLine}-${occurrence.endLine}
+
+Scope info:
+- scopeType: ${scopeInfo.scopeType}
+- scopeName: ${scopeInfo.scopeName}
+- scopeLines: ${scopeInfo.scopeStartLine}-${scopeInfo.scopeEndLine}
+
+Context arrays provided by user:
+- variablesInScope: [${variables.join(", ")}]
+- linesToConsider: [${lines.join(", ")}]
+
+Tasks:
+1) Remove ONLY the target occurrence safely.
+2) Fix any resulting errors (unresolved references, imports, params, returns) minimally.
+3) Preserve formatting as much as possible.
+4) Return the FULL UPDATED FILE CONTENT only. NO explanations, NO markdown, NO backticks.
+`;
+    const res = await model.generateContent(prompt);
+    return res.response.text().replace(/[`*]/g, "").trim();
+  }
 }
 function deactivate() {
 }
 function getWebviewContent() {
   return `<!DOCTYPE html>
-	<html lang="en">
-	<head>
-		<meta charset="UTF-8">
-		<meta name="viewport" content="width=device-width, initial-scale=1.0">
-		<title>Snapcode Webview</title>
-		<style>
-			body {
-				font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
-				padding: 20px;
-				background-color: #1e1e1e; /* Dark background */
-				color: #d4d4d4; /* Light text */
-			}
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Snapcode Webview</title>
+  <style>
+    body { font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif; padding: 20px; background-color: #1e1e1e; color: #d4d4d4; }
+    h1 { color: #4CAF50; margin-bottom: 10px; }
+    p { color: #cccccc; margin-bottom: 15px; }
+    input { width: 100%; padding: 10px; border-radius: 6px; border: 1px solid #333; background-color: #252526; color: #fff; margin-bottom: 15px; }
+    button { background: #4CAF50; color: white; border: none; padding: 10px 20px; cursor: pointer; border-radius: 6px; font-size: 14px; margin-right: 10px; transition: background 0.3s ease; }
+    button:hover { background: #45a049; }
+    pre { background-color: #252526; color: #d4d4d4; padding: 15px; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; border: 1px solid #333; font-family: Consolas, monospace; margin-top: 10px; }
+    #result { background-color: #133b22; color: #b6fcb6; padding: 15px; border-radius: 8px; margin-top: 10px; border: 1px solid #2b6e3f; }
+  </style>
+</head>
+<body>
+  <h1>\u{1F680} Snapcode Webview</h1>
+  <p>Analyze your code in a clean dark UI.</p>
 
-			h1 {
-				color: #4CAF50;
-				margin-bottom: 10px;
-			}
+  <label for="filename"><b>Enter file name:</b></label>
+  <input id="filename" placeholder="example.js"/>
 
-			p {
-				color: #cccccc;
-				margin-bottom: 15px;
-			}
+  <div>
+    <button onclick="analyze()">Check Unused Code</button>
+    <button onclick="sayHello()">Run HelloWorld</button>
+  </div>
 
-			input {
-				width: 100%;
-				padding: 10px;
-				border-radius: 6px;
-				border: 1px solid #333;
-				background-color: #252526;
-				color: #fff;
-				margin-bottom: 15px;
-			}
+  <h3>Result:</h3>
+  <pre id="result">Waiting...</pre>
 
-			button {
-				background: #4CAF50;
-				color: white;
-				border: none;
-				padding: 10px 20px;
-				cursor: pointer;
-				border-radius: 6px;
-				font-size: 14px;
-				margin-right: 10px;
-				transition: background 0.3s ease;
-			}
+  <!-- searching and fixing bar -->
+  <input id="filepath" placeholder="Enter file Path relative to workspace"/>
+  <input id="search" placeholder="Enter function /class/console.log to search"/>
+  <button onclick="analyze1()">Analyze</button>
 
-			button:hover {
-				background: #45a049;
-			}
+  <h3>AI Analysis Result:</h3>
+  <pre id="result1">Waiting...</pre>
+  <div id="occ-list"></div>
+  <div id="delete-form"></div>
 
-			pre {
-				background-color: #252526;
-				color: #d4d4d4;
-				padding: 15px;
-				border-radius: 8px;
-				white-space: pre-wrap;
-				word-wrap: break-word;
-				border: 1px solid #333;
-				font-family: Consolas, monospace;
-				margin-top: 10px;
-			}
+  <div id="merger"></div>
 
-			#result {
-				background-color: #133b22; /* Dark green block */
-				color: #b6fcb6;
-				padding: 15px;
-				border-radius: 8px;
-				margin-top: 10px;
-				border: 1px solid #2b6e3f;
-			}
-		</style>
-	</head>
-	<body>
-		<h1>\u{1F680} Snapcode Webview</h1>
-		<p>Analyze your code in a clean dark UI.</p>
+  <script>
+    const vscode = acquireVsCodeApi();
 
-		<label for="filename"><b>Enter file name:</b></label>
-		<input id="filename" placeholder="example.js"/>
+    window.addEventListener('message', event => {
+      const message = event.data;
 
-		<div>
-			<button onclick="analyze()">Check Unused Code</button>
-			<button onclick="sayHello()">Run HelloWorld</button>
-		</div>
+      if (message.command === 'showResult') {
+        document.getElementById('result').textContent = message.text;
+      }
 
-		<h3>Result:</h3>
-		<pre id="result">Waiting...</pre>
+      if (message.command === 'showResult1') {
+        // Keep for later actions
+        window.__lastFilepath = message.filepath || document.getElementById('filepath')?.value;
+        window.__lastOccurrences = message.occurrences || [];
+        renderOccurrences(message.occurrences, window.__lastFilepath);
+        document.getElementById('result1').textContent = message.raw || '';
+      }
 
-		//searching and fixing bar 
-              <input id ="filepath" placeholder = "Enter file Path relative to wrokspace"/>
-			  <input id ="search" placeholder = "Enter function /class/console.log to search"/>
-			  <button onclick="analyze1()">Analyze</button>
-			  <h3> AI Analysis Result: </h3>
-			  <Pre id= "result1"> Waiting...</pre>
+      if (message.command === 'confirmDelete') {
+        const { filepath, occurrence, scopeInfo } = message;
+        const varsStr = (scopeInfo.variables || []).join(', ');
+        const linesStr = (scopeInfo.lines || []).join(', ');
 
-		<script>
-			const vscode = acquireVsCodeApi();
+        document.getElementById('delete-form').innerHTML = \`
+          <div style="border:1px dashed #aaa;padding:10px;margin:10px 0;border-radius:8px;">
+            <div><b>Delete target:</b> \${occurrence.kind} \${occurrence.name} (\${occurrence.startLine}-\${occurrence.endLine})</div>
+            <div><b>Scope:</b> \${scopeInfo.scopeType} \${scopeInfo.scopeName} (\${scopeInfo.scopeStartLine}-\${scopeInfo.scopeEndLine})</div>
+            <label>Variables (array):</label>
+            <textarea id="varsArea" rows="3" style="width:100%;">\${varsStr}</textarea>
+            <label>Lines (array):</label>
+            <textarea id="linesArea" rows="3" style="width:100%;">\${linesStr}</textarea>
+            <button id="btnDoDelete">Delete with AI (auto-fix)</button>
+          </div>
+        \`;
 
+        document.getElementById('btnDoDelete').onclick = () => {
+          const variables = document.getElementById('varsArea').value.split(',').map(s => s.trim()).filter(Boolean);
+          const lines = document.getElementById('linesArea').value.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
+          vscode.postMessage({
+            command: 'performDelete',
+            filepath,
+            occurrence,
+            scopeInfo,
+            variables,
+            lines
+          });
+        };
+      }
 
-			window.addEventListener('message', event => {
-				const message = event.data;
-				console.log(message.text);
-				if (message.command === 'showResult') {
-					document.getElementById('result').textContent = message.text;
-				}
-                     
-				// insert the code analyze result into frontend
-				if( message.command === 'showResult1'){
-				document.getElementById('result1').textContent = message.text
-				}
-			});
-            
-			// analyze function for code checking
-			function analyze1(){
-			const filepath = document.getElementById('filepath').value;
-			const search = document.getElementById('search').value;
-			 vscode.postMessage({ command: 'analyzeCode',filepath,search});
-			}
+      if (message.command === 'showMerger') {
+        const { filepath, original, aiCode } = message;
+        document.getElementById('merger').innerHTML = \`
+          <h3>Snapcode Merger</h3>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;">
+            <div>
+              <div><b>Original</b></div>
+              <textarea id="origTA" rows="18" style="width:100%;">\${String(original).replace(/</g,'&lt;')}</textarea>
+              <button id="btnUseOrig">Use Original \u2192 Merge</button>
+            </div>
+            <div>
+              <div><b>AI (after delete & fix)</b></div>
+              <textarea id="aiTA" rows="18" style="width:100%;">\${String(aiCode).replace(/</g,'&lt;')}</textarea>
+              <button id="btnUseAI">Use AI \u2192 Merge</button>
+            </div>
+            <div>
+              <div><b>Merge (editable)</b></div>
+              <textarea id="mergeTA" rows="18" style="width:100%;"></textarea>
+              <div style="margin-top:8px; display:flex; gap:8px;">
+                <button id="btnSaveMerge">Apply Merge to File</button>
+              </div>
+            </div>
+          </div>
+        \`;
+        const mergeTA = document.getElementById('mergeTA');
+        document.getElementById('btnUseOrig').onclick = () => { mergeTA.value = document.getElementById('origTA').value; };
+        document.getElementById('btnUseAI').onclick = () => { mergeTA.value = document.getElementById('aiTA').value; };
+        document.getElementById('btnSaveMerge').onclick = () => {
+          const merged = mergeTA.value;
+          vscode.postMessage({ command: 'applyMergedCode', filepath, merged });
+        };
+      }
 
-               // analyze function for file analyze
-		  function analyze() {
-				const filename = document.getElementById('filename').value;
-				vscode.postMessage({ command: 'analyzeFile', filename });
-			}
+      if (message.command === 'toast') {
+        // simple fallback toast
+        alert(message.text);
+      }
+    });
 
-			function sayHello() {
-				vscode.postMessage({ command: 'runsHelloWorld' });
-			}
+    // analyze function for code checking
+    function analyze1() {
+      const filepath = document.getElementById('filepath').value;
+      const search = document.getElementById('search').value;
+      vscode.postMessage({ command: 'analyzeCode', filepath, search });
+    }
 
+    // analyze function for file analyze
+    function analyze() {
+      const filename = document.getElementById('filename').value;
+      vscode.postMessage({ command: 'analyzeFile', filename });
+    }
 
+    function sayHello() {
+      vscode.postMessage({ command: 'runsHelloWorld' });
+    }
 
-		</script>
-	</body>
-	</html>`;
+    function renderOccurrences(list, filepath) {
+      const container = document.getElementById('occ-list');
+      if (!list || !list.length) {
+        container.innerHTML = "<p>No matches.</p>";
+        return;
+      }
+      container.innerHTML = list.map((o, i) => \`
+        <div style="border:1px solid #ddd;padding:8px;margin:8px 0;border-radius:8px;">
+          <b>\${o.kind}:</b> \${o.name}<br>
+          <b>Scope:</b> \${o.scope}<br>
+          <b>Lines:</b> \${o.startLine}-\${o.endLine}<br>
+          <pre style="white-space:pre-wrap">\${String(o.code).replace(/</g,'&lt;')}</pre>
+          <button data-idx="\${i}" class="btn-delete">Delete this occurrence</button>
+        </div>
+      \`).join("");
+
+      container.querySelectorAll(".btn-delete").forEach(btn => {
+        btn.addEventListener("click", (e) => {
+          const idx = +e.currentTarget.getAttribute("data-idx");
+          const occ = list[idx];
+          vscode.postMessage({ command: "requestScopeInfo", filepath, index: idx, occurrence: occ });
+        });
+      });
+    }
+  </script>
+</body>
+</html>`;
 }
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
